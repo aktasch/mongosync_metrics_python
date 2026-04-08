@@ -1,217 +1,435 @@
 import plotly.graph_objects as go
-import plotly.subplots as sp
-from plotly.io import write_image
-from plotly.utils import PlotlyJSONEncoder
 from plotly.subplots import make_subplots
-from tqdm import tqdm
-from flask import Flask, request, redirect, url_for, render_template_string, send_from_directory
+from plotly.utils import PlotlyJSONEncoder
+from flask import Flask, request, render_template
 import json
 from datetime import datetime
-import io
-import base64
-from werkzeug.utils import secure_filename
-import matplotlib.pyplot as plt
+import logging
 import os
 
-# Create a Flask app
-app = Flask(__name__)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Constants
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+ALLOWED_EXTENSIONS = {'json', 'log', 'txt'}
+
+# Create Flask app
+app = Flask(__name__, template_folder='templates')
+app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
+
+
+def allowed_file(filename):
+    """Check if file extension is allowed."""
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def parse_log_lines(lines):
+    """
+    Single-pass log parsing to extract all message types.
+    Returns dict with lists of parsed JSON for each message type.
+    """
+    parsed_data = {
+        'replication_progress': [],
+        'version_info': [],
+        'mongosync_options': [],
+        'operation_stats': [],
+        'sent_response': []
+    }
+
+    for line_idx, line in enumerate(lines):
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            logger.error(f"Invalid JSON on line {line_idx + 1}: {line[:100]}")
+            raise ValueError(f"Invalid JSON on line {line_idx + 1}")
+
+        message = parsed.get('message', '')
+
+        if message == 'Replication progress.':
+            parsed_data['replication_progress'].append(parsed)
+        elif message == 'Version info':
+            parsed_data['version_info'].append(parsed)
+        elif message == 'Mongosync Options':
+            parsed_data['mongosync_options'].append(parsed)
+        elif message == 'Recent operation duration stats.':
+            parsed_data['operation_stats'].append(parsed)
+        elif message == 'Sent response.':
+            parsed_data['sent_response'].append(parsed)
+
+    return parsed_data
+
+
+def extract_metrics(data):
+    """Extract and organize all metrics from parsed data."""
+    metrics = {
+        'times': [],
+        'totalEventsApplied': [],
+        'lagTimeSeconds': [],
+        'estimated_total_bytes': 0,
+        'estimated_copied_bytes': 0,
+        'ops_times': [],
+        'CollectionCopySourceRead': [],
+        'CollectionCopySourceRead_maximum': [],
+        'CollectionCopySourceRead_numOperations': [],
+        'CollectionCopyDestinationWrite': [],
+        'CollectionCopyDestinationWrite_maximum': [],
+        'CollectionCopyDestinationWrite_numOperations': [],
+        'CEASourceRead': [],
+        'CEASourceRead_maximum': [],
+        'CEASourceRead_numOperations': [],
+        'CEADestinationWrite': [],
+        'CEADestinationWrite_maximum': [],
+        'CEADestinationWrite_numOperations': [],
+    }
+
+    # Extract replication progress metrics
+    for item in data['replication_progress']:
+        if 'time' in item:
+            try:
+                time = datetime.strptime(item['time'][:26], "%Y-%m-%dT%H:%M:%S.%f")
+                metrics['times'].append(time)
+                if 'totalEventsApplied' in item:
+                    metrics['totalEventsApplied'].append(item['totalEventsApplied'])
+                if 'lagTimeSeconds' in item:
+                    metrics['lagTimeSeconds'].append(item['lagTimeSeconds'])
+            except ValueError as e:
+                logger.warning(f"Failed to parse time {item.get('time')}: {e}")
+
+    # Extract operation stats metrics with their own timestamps
+    ops_times = []
+    for item in data['operation_stats']:
+        if 'time' in item:
+            try:
+                time = datetime.strptime(item['time'][:26], "%Y-%m-%dT%H:%M:%S.%f")
+                ops_times.append(time)
+            except ValueError:
+                pass
+
+    metrics['ops_times'] = ops_times
+
+    # Extract operation duration stats
+    for item in data['operation_stats']:
+        if 'CollectionCopySourceRead' in item:
+            cc_src = item['CollectionCopySourceRead']
+            if 'averageDurationMs' in cc_src:
+                metrics['CollectionCopySourceRead'].append(float(cc_src['averageDurationMs']))
+            if 'maximumDurationMs' in cc_src:
+                metrics['CollectionCopySourceRead_maximum'].append(float(cc_src['maximumDurationMs']))
+            if 'numOperations' in cc_src:
+                metrics['CollectionCopySourceRead_numOperations'].append(float(cc_src['numOperations']))
+
+        if 'CollectionCopyDestinationWrite' in item:
+            cc_dst = item['CollectionCopyDestinationWrite']
+            if 'averageDurationMs' in cc_dst:
+                metrics['CollectionCopyDestinationWrite'].append(float(cc_dst['averageDurationMs']))
+            if 'maximumDurationMs' in cc_dst:
+                metrics['CollectionCopyDestinationWrite_maximum'].append(float(cc_dst['maximumDurationMs']))
+            if 'numOperations' in cc_dst:
+                metrics['CollectionCopyDestinationWrite_numOperations'].append(float(cc_dst['numOperations']))
+
+        if 'CEASourceRead' in item:
+            cea_src = item['CEASourceRead']
+            if 'averageDurationMs' in cea_src:
+                metrics['CEASourceRead'].append(float(cea_src['averageDurationMs']))
+            if 'maximumDurationMs' in cea_src:
+                metrics['CEASourceRead_maximum'].append(float(cea_src['maximumDurationMs']))
+            if 'numOperations' in cea_src:
+                metrics['CEASourceRead_numOperations'].append(float(cea_src['numOperations']))
+
+        if 'CEADestinationWrite' in item:
+            cea_dst = item['CEADestinationWrite']
+            if 'averageDurationMs' in cea_dst:
+                metrics['CEADestinationWrite'].append(float(cea_dst['averageDurationMs']))
+            if 'maximumDurationMs' in cea_dst:
+                metrics['CEADestinationWrite_maximum'].append(float(cea_dst['maximumDurationMs']))
+            if 'numOperations' in cea_dst:
+                metrics['CEADestinationWrite_numOperations'].append(float(cea_dst['numOperations']))
+
+    # Extract bytes from sent response (use the last response body if multiple exist)
+    if data['sent_response']:
+        for response in reversed(data['sent_response']):
+            if 'body' in response:
+                try:
+                    body = json.loads(response['body'])
+                    if 'progress' in body and 'collectionCopy' in body['progress']:
+                        cc = body['progress']['collectionCopy']
+                        if 'estimatedTotalBytes' in cc:
+                            metrics['estimated_total_bytes'] = cc['estimatedTotalBytes']
+                        if 'estimatedCopiedBytes' in cc:
+                            metrics['estimated_copied_bytes'] = cc['estimatedCopiedBytes']
+                        break  # Use the last valid response
+                except (json.JSONDecodeError, KeyError) as e:
+                    logger.warning(f"Failed to parse sent response body: {e}")
+
+    return metrics
+
+
+def build_figure(metrics, options_table, version_info):
+    """Build Plotly figure with all subplots."""
+    fig = make_subplots(
+        rows=7, cols=1,
+        subplot_titles=(
+            "Estimated Copied Bytes",
+            "Total Events Applied",
+            "Collection Copy Source Read",
+            "Collection Copy Destination Write",
+            "CEA Source Read",
+            "CEA Destination Write",
+            "MongoSync Options"
+        ),
+        specs=[[{}], [{}], [{}], [{}], [{}], [{}], [{"type": "table"}]]
+    )
+
+    # Add version info annotation
+    if version_info:
+        fig.add_annotation(
+            x=0.5, y=1.05, xref="paper", yref="paper",
+            text=version_info, showarrow=False,
+            font=dict(size=12)
+        )
+
+    # Row 1: Estimated bytes bar chart
+    fig.add_trace(
+        go.Bar(
+            name='Estimated Total Bytes',
+            x=['Bytes'],
+            y=[metrics['estimated_total_bytes']],
+            marker=dict(color='#1f77b4')
+        ),
+        row=1, col=1
+    )
+    fig.add_trace(
+        go.Bar(
+            name='Estimated Copied Bytes',
+            x=['Bytes'],
+            y=[metrics['estimated_copied_bytes']],
+            marker=dict(color='#ff7f0e')
+        ),
+        row=1, col=1
+    )
+
+    # Row 2: Replication progress
+    fig.add_trace(
+        go.Scatter(
+            x=metrics['times'],
+            y=metrics['totalEventsApplied'],
+            mode='lines',
+            name='Total Events Applied',
+            line=dict(color='#2ca02c')
+        ),
+        row=2, col=1
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=metrics['times'],
+            y=metrics['lagTimeSeconds'],
+            mode='lines',
+            name='Lag Time Seconds',
+            line=dict(color='#d62728')
+        ),
+        row=2, col=1
+    )
+
+    # Row 3: Collection Copy Source Read
+    fig.add_trace(
+        go.Scatter(x=metrics['ops_times'], y=metrics['CollectionCopySourceRead'],
+                   mode='lines', name='CC Source Read Avg', line=dict(color='#9467bd')),
+        row=3, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=metrics['ops_times'], y=metrics['CollectionCopySourceRead_maximum'],
+                   mode='lines', name='CC Source Read Max', line=dict(color='#8c564b', dash='dash')),
+        row=3, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=metrics['ops_times'], y=metrics['CollectionCopySourceRead_numOperations'],
+                   mode='lines', name='CC Source Read Ops', line=dict(color='#e377c2', dash='dot')),
+        row=3, col=1
+    )
+
+    # Row 4: Collection Copy Destination Write
+    fig.add_trace(
+        go.Scatter(x=metrics['ops_times'], y=metrics['CollectionCopyDestinationWrite'],
+                   mode='lines', name='CC Dest Write Avg', line=dict(color='#7f7f7f')),
+        row=4, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=metrics['ops_times'], y=metrics['CollectionCopyDestinationWrite_maximum'],
+                   mode='lines', name='CC Dest Write Max', line=dict(color='#bcbd22', dash='dash')),
+        row=4, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=metrics['ops_times'], y=metrics['CollectionCopyDestinationWrite_numOperations'],
+                   mode='lines', name='CC Dest Write Ops', line=dict(color='#17becf', dash='dot')),
+        row=4, col=1
+    )
+
+    # Row 5: CEA Source Read
+    fig.add_trace(
+        go.Scatter(x=metrics['ops_times'], y=metrics['CEASourceRead'],
+                   mode='lines', name='CEA Source Read Avg', line=dict(color='#ff9896')),
+        row=5, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=metrics['ops_times'], y=metrics['CEASourceRead_maximum'],
+                   mode='lines', name='CEA Source Read Max', line=dict(color='#98df8a', dash='dash')),
+        row=5, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=metrics['ops_times'], y=metrics['CEASourceRead_numOperations'],
+                   mode='lines', name='CEA Source Read Ops', line=dict(color='#c5b0d5', dash='dot')),
+        row=5, col=1
+    )
+
+    # Row 6: CEA Destination Write
+    fig.add_trace(
+        go.Scatter(x=metrics['ops_times'], y=metrics['CEADestinationWrite'],
+                   mode='lines', name='CEA Dest Write Avg', line=dict(color='#c49c94')),
+        row=6, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=metrics['ops_times'], y=metrics['CEADestinationWrite_maximum'],
+                   mode='lines', name='CEA Dest Write Max', line=dict(color='#f7b6d2', dash='dash')),
+        row=6, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=metrics['ops_times'], y=metrics['CEADestinationWrite_numOperations'],
+                   mode='lines', name='CEA Dest Write Ops', line=dict(color='#c7c7c7', dash='dot')),
+        row=6, col=1
+    )
+
+    # Row 7: Options table
+    fig.add_trace(options_table, row=7, col=1)
+
+    # Update layout with responsive sizing
+    fig.update_layout(
+        height=1800,
+        title_text="Mongosync Replication Metrics",
+        showlegend=True,
+        hovermode='x unified',
+        autosize=True,
+        margin=dict(l=50, r=50, t=80, b=50)
+    )
+
+    return fig
+
+
+def build_options_table(mongosync_options):
+    """Build table trace from mongosync options."""
+    if not mongosync_options:
+        return go.Table(
+            header=dict(values=['Mongosync Options']),
+            cells=dict(values=[['No options found in log file']])
+        )
+
+    options = mongosync_options[0]
+    keys = list(options.keys())
+    values = [[options.get(k, '') for k in keys]]
+
+    # Flatten hiddenFlags if present
+    flattened_keys = []
+    flattened_values = []
+    for k, v in zip(keys, values[0]):
+        if k == 'hiddenFlags' and isinstance(v, dict):
+            for hk, hv in v.items():
+                flattened_keys.append(f"hiddenFlags.{hk}")
+                flattened_values.append(hv)
+        else:
+            flattened_keys.append(k)
+            flattened_values.append(v)
+
+    return go.Table(
+        header=dict(values=['Key', 'Value'], font=dict(size=12, color='black')),
+        cells=dict(values=[flattened_keys, flattened_values], font=dict(size=10, color='darkblue')),
+        columnwidth=[0.75, 2.5]
+    )
+
+
+def format_version_info(version_info_list):
+    """Format version info for display."""
+    if not version_info_list:
+        return ""
+
+    # Use the first version info entry
+    info = version_info_list[0]
+    return (f"MongoSync Version: {info.get('version', 'N/A')}, "
+            f"OS: {info.get('os', 'N/A')}, "
+            f"Arch: {info.get('arch', 'N/A')}")
+
 
 @app.route('/')
 def upload_form():
-    # Return a simple file upload form
-    return render_template_string('''
-        <form method="post" action="/upload" enctype="multipart/form-data">
-            <input type="file" name="file">
-            <input type="submit" value="Upload">
-            <p>This form allows you to upload a mongosync log file. Once the file is uploaded, the application will process the data and generate plots.</p>
-            <img src="/path/to/image.jpg" alt="Description of image">
-        </form>
-    ''')
+    """Render file upload form."""
+    error = request.args.get('error')
+    return render_template('index.html', error=error)
+
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    # Check if a file was uploaded
+    """Process uploaded log file and generate plots."""
     if 'file' not in request.files:
-        return redirect(request.url)
+        return render_template('index.html', error='No file selected')
 
     file = request.files['file']
 
-    # If the user does not select a file, the browser submits an
-    # empty file without a filename.
     if file.filename == '':
-        return redirect(request.url)
+        return render_template('index.html', error='No file selected')
 
-    if file:
-        # Read the file and convert it to a list of lines
-        lines = list(file)
+    if not allowed_file(file.filename):
+        return render_template(
+            'index.html',
+            error=f'Invalid file type. Allowed: {", ".join(ALLOWED_EXTENSIONS)}'
+        )
 
-        # Check if all lines are valid JSON
-        for line in tqdm(lines, desc="Reading lines"):
-            try:
-                json.loads(line)
-            except json.JSONDecodeError:
-                print(f"Invalid JSON: {line}")
-                return redirect(request.url)  # or handle the error in another appropriate way
+    try:
+        # Read file lines (bytes from Flask file object)
+        lines = [line.decode('utf-8', errors='ignore') for line in file]
 
-        # Load lines with 'message' == "Replication progress."
-        data = [json.loads(line) for line in lines if json.loads(line).get('message') == "Replication progress."]
+        if not lines:
+            return render_template('index.html', error='Log file is empty')
 
-        # Load lines with 'message' == "Version info"
-        version_info_list = [json.loads(line) for line in lines if json.loads(line).get('message') == "Version info"]
+        logger.info(f"Parsing {len(lines)} log lines from {file.filename}")
 
-        # Load lines with 'message' == "Mongosync Options"
-        mongosync_opts_list = [json.loads(line) for line in lines if json.loads(line).get('message') == "Mongosync Options"]
+        # Single-pass parsing
+        data = parse_log_lines(lines)
 
-        # Load lines with 'message' == "Operation duration stats."
-        mongosync_ops_stats = [json.loads(line) for line in lines if json.loads(line).get('message') == "Operation duration stats."]
-
-        # Load lines with 'message' == "sent response"
-        mongosync_sent_response = [json.loads(line) for line in lines if json.loads(line).get('message') == "sent response"]
-
-        # The 'body' field is also a JSON string, so parse that as well
-        #mongosync_sent_response_body = json.loads(mongosync_sent_response['body'])
-        for response in mongosync_sent_response:
-            mongosync_sent_response_body  = json.loads(response['body'])
-            # Now you can work with the 'body' data
-
-        # Create a string with all the Mongosync Options information
-        mongosync_opts_text = "\n".join([json.dumps(item, indent=4) for item in mongosync_opts_list])
-
-        # Create a string with all the version information
-        version_text = "\n".join([f"MongoSync Version: {item.get('version')}, OS: {item.get('os')}, Arch: {item.get('arch')}" for item in version_info_list])
-
-        # Extract the keys from the first dictionary in mongosync_opts_list
-        # For each key, extract the corresponding values from all dictionaries in mongosync_opts_list
-        if mongosync_opts_list:
-            keys = list(mongosync_opts_list[0].keys())
-            values = [[item[key] for item in mongosync_opts_list] for key in keys]
-
-            # Create a table trace with the keys as the first column and the corresponding values as the second column
-            table_trace = go.Table(
-                header=dict(values=['Key', 'Value'], font=dict(size=12, color='black')),
-                cells=dict(values=[keys, values], font=dict(size=10, color='darkblue')),
-                columnwidth=[0.75, 2.5]  # Adjust the column widths as needed
+        # Check if we have any relevant data
+        if not data['replication_progress'] and not data['operation_stats']:
+            logger.warning('No replication progress or operation stats found in log')
+            return render_template(
+                'index.html',
+                error='No mongosync metrics found in log file'
             )
 
-            # Extract the data you want to plot
-            times = [datetime.strptime(item['time'][:26], "%Y-%m-%dT%H:%M:%S.%f") for item in data if 'time' in item]
-            totalEventsApplied = [item['totalEventsApplied'] for item in data if 'totalEventsApplied' in item]
-            lagTimeSeconds = [item['lagTimeSeconds'] for item in data if 'lagTimeSeconds' in item]
+        # Extract metrics
+        metrics = extract_metrics(data)
 
-            # Add the table trace to the figure
-            #fig.add_trace(table_trace, row=7, col=1)
+        # Build table and version info
+        options_table = build_options_table(data['mongosync_options'])
+        version_info = format_version_info(data['version_info'])
 
-            # If the key is 'hiddenFlags', extract its keys and values and add them to the keys and values lists
-            for i, key in enumerate(keys):
-                if key == 'hiddenFlags':
-                    hidden_keys = list(values[i][0].keys())
-                    hidden_values = [[item.get(key, '') for item in values[i]] for key in hidden_keys]
-                    keys = keys[:i] + hidden_keys + keys[i+1:]
-                    values = values[:i] + hidden_values + values[i+1:]
-        else:
-            #print("mongosync_opts_list is empty")
-            table_trace = go.Table(header=dict(values=['Mongosync Options']),
-            cells=dict(values=[["No Mongosync Options found in the log file"]]))
+        # Build figure
+        fig = build_figure(metrics, options_table, version_info)
 
-
-        # Extract the data you want to plot
-        times = [datetime.strptime(item['time'][:26], "%Y-%m-%dT%H:%M:%S.%f") for item in data if 'time' in item]
-        totalEventsApplied = [item['totalEventsApplied'] for item in data if 'totalEventsApplied' in item]
-        lagTimeSeconds = [item['lagTimeSeconds'] for item in data if 'lagTimeSeconds' in item]
-        CollectionCopySourceRead = [float(item['CollectionCopySourceRead']['averageDurationMs']) for item in mongosync_ops_stats if 'CollectionCopySourceRead' in item and 'averageDurationMs' in item['CollectionCopySourceRead']]
-        CollectionCopySourceRead_maximum = [float(item['CollectionCopySourceRead']['maximumDurationMs']) for item in mongosync_ops_stats if 'CollectionCopySourceRead' in item and 'maximumDurationMs' in item['CollectionCopySourceRead']]
-        CollectionCopySourceRead_numOperations = [float(item['CollectionCopySourceRead']['numOperations']) for item in mongosync_ops_stats if 'CollectionCopySourceRead' in item and 'numOperations' in item['CollectionCopySourceRead']]        
-        CollectionCopyDestinationWrite = [float(item['CollectionCopyDestinationWrite']['averageDurationMs']) for item in mongosync_ops_stats if 'CollectionCopyDestinationWrite' in item and 'averageDurationMs' in item['CollectionCopyDestinationWrite']]
-        CollectionCopyDestinationWrite_maximum  = [float(item['CollectionCopyDestinationWrite']['maximumDurationMs']) for item in mongosync_ops_stats if 'CollectionCopyDestinationWrite' in item and 'maximumDurationMs' in item['CollectionCopyDestinationWrite']]
-        CollectionCopyDestinationWrite_numOperations = [float(item['CollectionCopyDestinationWrite']['numOperations']) for item in mongosync_ops_stats if 'CollectionCopyDestinationWrite' in item and 'numOperations' in item['CollectionCopyDestinationWrite']]
-        CEASourceRead = [float(item['CEASourceRead']['averageDurationMs']) for item in mongosync_ops_stats if 'CEASourceRead' in item and 'averageDurationMs' in item['CEASourceRead']]
-        CEASourceRead_maximum  = [float(item['CEASourceRead']['maximumDurationMs']) for item in mongosync_ops_stats if 'CEASourceRead' in item and 'maximumDurationMs' in item['CEASourceRead']]
-        CEASourceRead_numOperations = [float(item['CEASourceRead']['numOperations']) for item in mongosync_ops_stats if 'CEASourceRead' in item and 'numOperations' in item['CEASourceRead']]
-        CEADestinationWrite = [float(item['CEADestinationWrite']['averageDurationMs']) for item in mongosync_ops_stats if 'CEADestinationWrite' in item and 'averageDurationMs' in item['CEADestinationWrite']]
-        CEADestinationWrite_maximum = [float(item['CEADestinationWrite']['maximumDurationMs']) for item in mongosync_ops_stats if 'CEADestinationWrite' in item and 'maximumDurationMs' in item['CEADestinationWrite']]    
-        CEADestinationWrite_numOperations = [float(item['CEADestinationWrite']['numOperations']) for item in mongosync_ops_stats if 'CEADestinationWrite' in item and 'numOperations' in item['CEADestinationWrite']] 
-
-        # Extract the 'estimatedTotalBytes' and 'estimatedCopiedBytes' values
-        #estimated_total_bytes = mongosync_sent_response_body['progress']['collectionCopy']['estimatedTotalBytes']
-
-        if 'progress' in mongosync_sent_response_body:
-            estimated_total_bytes = mongosync_sent_response_body['progress']['collectionCopy']['estimatedTotalBytes']
-        #    fig.add_trace( go.Bar( name='Estimated Total Bytes',  x=['Bytes'],  y=[estimated_total_bytes] ), row=1, col=1)
-        else:
-            print("Key 'progress' not found in mongosync_sent_response_body")
-        #estimated_copied_bytes = mongosync_sent_response_body['progress']['collectionCopy']['estimatedCopiedBytes']
-        # Initialize estimated_total_bytes with a default value
-        estimated_total_bytes = 0
-        estimated_copied_bytes = 0
-
-        if 'progress' in mongosync_sent_response_body:
-            estimated_total_bytes = mongosync_sent_response_body['progress']['collectionCopy']['estimatedTotalBytes']
-
-        #fig.add_trace( go.Bar( name='Estimated Total Bytes',  x=['Bytes'],  y=[estimated_total_bytes] ), row=1, col=1)
-
-        #estimated_copied_time = mongosync_sent_response_body['time']
-
-
-        # Create a subplot for the scatter plots and a separate subplot for the table
-        fig = make_subplots(rows=7, cols=1, subplot_titles=("Estimated Copied Bytes", "Total Events Applied", "Collection Copy Source Read", "Collection Copy Destination Write", "CEA Source Read", "CEA Destination Write", "MongoSync Options"), specs=[[{}],[{}], [{}], [{}], [{}],[{}],[{"type": "table"}]])
-
-        # Add the version information as an annotation to the plot
-        fig.add_annotation( x=0.5, y=1.05, xref="paper", yref="paper", text=version_text, showarrow=False, font=dict(size=12))
-
-
-        # Create a bar chart
-        #fig = go.Figure(data=[go.Bar(name='Estimated Total Bytes', x=['Bytes'], y=[estimated_total_bytes], row=1, col=1), go.Bar(name='Estimated Copied Bytes', x=['Bytes'], y=[estimated_copied_bytes])], row=1, col=1)
-        fig.add_trace( go.Bar( name='Estimated Total Bytes',  x=['Bytes'],  y=[estimated_total_bytes] ), row=1, col=1)
-        fig.add_trace( go.Bar( name='Estimated Copied Bytes', x=['Bytes'],  y=[estimated_copied_bytes]), row=1, col=1)
-        # If times is also a single value
-#        fig.add_trace(go.Scatter(x=[times], y=[estimated_copied_bytes], mode='lines', name='Estimated Copied Bytes Line'), row=1, col=1)
-
-        # Or if times is a list of values
-#        fig.add_trace(go.Scatter(x=times, y=[estimated_copied_bytes]*len(times), mode='lines', name='Estimated Copied Bytes Line'), row=1, col=1)
-
-        # Add traces
-        fig.add_trace(go.Scatter(x=times, y=totalEventsApplied, mode='lines', name='Total Events Applied'), row=2, col=1)
-        fig.add_trace(go.Scatter(x=times, y=lagTimeSeconds, mode='lines', name='Lag Time Seconds'), row=2, col=1)
-        fig.add_trace(go.Scatter(x=times, y=CollectionCopySourceRead, mode='lines', name='Collection Copy Source Read Average'), row=3, col=1)
-        fig.add_trace(go.Scatter(x=times, y=CollectionCopySourceRead_maximum, mode='lines', name='Collection Copy Source Read Maximum'), row=3, col=1)
-        fig.add_trace(go.Scatter(x=times, y=CollectionCopySourceRead_numOperations, mode='lines', name='Collection Copy Source Read Number of Operations'), row=3, col=1)
-        fig.add_trace(go.Scatter(x=times, y=CollectionCopyDestinationWrite, mode='lines', name='Collection Copy Destination Write Average'), row=4, col=1)
-        fig.add_trace(go.Scatter(x=times, y=CollectionCopyDestinationWrite_maximum, mode='lines', name='Collection Copy Destination Write Maximum'), row=4, col=1)
-        fig.add_trace(go.Scatter(x=times, y=CollectionCopyDestinationWrite_numOperations, mode='lines', name='Collection Copy Destination Write Number of Operations'), row=4, col=1)
-        fig.add_trace(go.Scatter(x=times, y=CEASourceRead, mode='lines', name='CEA Source Read Average'), row=5, col=1)
-        fig.add_trace(go.Scatter(x=times, y=CEASourceRead_maximum, mode='lines', name='CEA Source Read Maximum'), row=5, col=1)
-        fig.add_trace(go.Scatter(x=times, y=CEASourceRead_numOperations, mode='lines', name='CEA Source Read Number of Operations'), row=5, col=1)
-        fig.add_trace(go.Scatter(x=times, y=CEADestinationWrite, mode='lines', name='CEA Destination Write Average'), row=6, col=1)
-        fig.add_trace(go.Scatter(x=times, y=CEADestinationWrite_maximum, mode='lines', name='CEA Destination Write Maximum'), row=6, col=1)
-        fig.add_trace(go.Scatter(x=times, y=CEADestinationWrite_numOperations, mode='lines', name='CEA Destination Write Number of Operations'), row=6, col=1)
-        fig.add_trace(table_trace, row=7, col=1)
-
-        # Update layout
-        fig.update_layout(height=1800, width=1250, title_text="Replication Progress")
-
-        # Convert the figure to JSON
+        # Convert to JSON
         plot_json = json.dumps(fig, cls=PlotlyJSONEncoder)
 
-        # Render the plot in the browser
-        return render_template_string('''
-            <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-            <div id="plot"></div>
-            <script>
-            var plot = {{ plot_json | safe }};
-            Plotly.newPlot('plot', plot.data, plot.layout);
-            </script>
-        ''', plot_json=plot_json)
-    
-@app.route('/plot')
-def serve_plot():
-    file_path = os.path.join(app.static_folder, 'plot.png')
-    print(file_path)  # print the file path
+        logger.info(f"Successfully processed {file.filename}")
 
-    if os.path.exists(file_path):
-        return send_from_directory(app.static_folder, 'plot.png')
-    else:
-        return "File not found", 404
+        return render_template('plot.html', plot_json=plot_json, version_info=version_info)
+
+    except ValueError as e:
+        logger.error(f"Validation error: {e}")
+        return render_template('index.html', error=f'Invalid log format: {str(e)}')
+    except Exception as e:
+        logger.error(f"Error processing file: {e}", exc_info=True)
+        return render_template('index.html', error=f'Error processing file: {str(e)}')
+
 
 if __name__ == '__main__':
-    # Run the Flask app
-    app.run(host='0.0.0.0', port=3030)
+    app.run(host='0.0.0.0', port=3030, debug=False)

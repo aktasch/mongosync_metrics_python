@@ -1,14 +1,24 @@
 # mongosync_metrics_python
 
-This project contains a Python script, `mongosync_plotly_multiple.py`, that processes the `mongosync` JSON data and generates various plots using Plotly on port **3030**. The script also includes a Dockerfile for containerizing the application and a `requirements.txt` file listing the Python dependencies.
+A Flask web application that analyzes MongoDB mongosync JSON logs and generates interactive Plotly visualizations of replication metrics on port **3030**.
 
-![Alt text for image 1](static/image-1.png)
+The application accepts log files via a web form, validates all JSON lines, extracts specific message types, and creates time-series charts showing replication progress, lag time, and operation duration statistics. It includes a Dockerfile for containerization and comprehensive error handling.
 
-## mongosync_plotly_multiple.py
+![Alt text for image 1](static/centered_home.png)
 
-This Python script processes JSON data and generates various plots using Plotly. The plots include scatter plots and tables, and they visualize different aspects of the data, such as `CEA Destination Write`, `Collection Copy Source Read`, and `Collection Copy Destination Write`.
+## How It Works
 
-The script uses the Plotly library for creating the plots and the pandas library for data manipulation. It also uses the datetime library for handling time data.
+The Flask application (`mongosync_plotly_multiple.py`) provides two routes:
+
+1. **Upload Form** (`GET /`) — Web interface for uploading mongosync log files (.json, .log, or .txt)
+2. **Processing** (`POST /upload`) — Processes uploaded logs and returns interactive visualizations:
+   - Validates JSON format (50MB max file size)
+   - Extracts 5 message types in a single pass: `"Replication progress."`, `"Version info"`, `"Mongosync Options"`, `"Recent operation duration stats."`, `"Sent response."`
+   - Parses metrics: total events applied, lag time, operation duration stats (average/maximum/count) for Collection Copy and CEA operations
+   - Generates 7-subplot Plotly figure (6 time-series charts + 1 options table)
+   - Displays with responsive, centered layout using Jinja2 templates
+
+The application uses Python's `logging` module for configurable output and provides clear error messages for invalid files or malformed JSON.
 
 ## Dockerfile
 
@@ -28,7 +38,7 @@ docker run -it --rm --name my-running-app my-python-app
 
 ## requirements.txt
 
-The `requirements.txt` file lists the Python packages that the script depends on. The packages are specified with their version numbers to ensure compatibility.          
+The `requirements.txt` file lists the Python packages that the script depends on. The packages are specified with their version numbers to ensure compatibility.
 
 To install the dependencies, use the following command:
 
@@ -51,7 +61,7 @@ Please note that you need to have Python and pip installed on your machine to ru
 
 Once the application is running, you can access it by opening a web browser and navigating to `http://localhost:3030`. This assumes that the application is running on the same machine where you're opening the browser, and that it's configured to listen on port 3030.
 
-![Alt text for image 2](static/image-2.png)
+![Alt text for image 2](static/centered_results.png)
 
 ## Uploading the mongosync Log File
 

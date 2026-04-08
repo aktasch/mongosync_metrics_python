@@ -1,2 +1,6 @@
-mongosync_plotly_multiple copy.py
-README copy.md 
+venv/*
+.playwright-mcp/*
+test_mongosync.log
+.claude/*
+.vscode/*
+mongosync.log
